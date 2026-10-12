@@ -1,0 +1,80 @@
+# Singularity/Apptainer recipe for the ET-BETIF wdflow kernel, built directly on
+# BETIF from the wdflow clone there. It is Dockerfile.betif-kernel translated:
+# the platform's kernel baseline (AlmaLinux 9, conda env "kernel", rucio/gfal2,
+# ipykernel) plus wdflow from the checkout. Only almalinux:9 comes from a
+# container registry; everything else is yum, conda and pip over HTTPS.
+#
+# From the root of the wdflow clone:
+#   export SINGULARITY_CACHEDIR=$HOME/.singularity/cache SINGULARITY_TMPDIR=$HOME/.singularity/tmp
+#   mkdir -p $SINGULARITY_CACHEDIR $SINGULARITY_TMPDIR
+#   GODEBUG=http2client=0 singularity build --fakeroot kernel-wdflow.sif wdflow-betif-kernel.def
+# then register kernel-wdflow.sif through the Kernelspec Manager's Template icon.
+#
+# The %files paths are relative to the directory the build is run from, which
+# has to be the root of the clone.
+
+Bootstrap: docker
+From: almalinux:9
+
+%files
+    pyproject.toml /opt/wdflow-src/pyproject.toml
+    README.md /opt/wdflow-src/README.md
+    wdf /opt/wdflow-src/wdf
+
+%environment
+    export CONDA_DIR=/opt/conda
+    export PATH=/opt/conda/envs/kernel/bin:/opt/conda/bin:$PATH
+    export TINI_VERSION=v0.19.0
+    # The image is read-only: numba (ssqueezepy's cache=True jits) and
+    # matplotlib write their caches here instead.
+    export NUMBA_CACHE_DIR=${TMPDIR:-/tmp}/numba_cache
+    export MPLCONFIGDIR=${TMPDIR:-/tmp}/matplotlib
+
+%post
+    set -e
+
+    # ---- platform baseline ------------------------------------------------
+    yum -y clean metadata
+    yum install -y dnf-plugins-core
+    yum -y install epel-release git wget python39 python3-pip python3-devel boost-python3 jq procps
+    yum -y install voms-clients-cpp
+    yum -y clean all
+
+    export CONDA_DIR=/opt/conda
+    wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-py311_25.3.1-1-Linux-x86_64.sh -O /tmp/miniconda.sh
+    /bin/bash /tmp/miniconda.sh -b -p $CONDA_DIR
+    rm /tmp/miniconda.sh
+    export PATH=$CONDA_DIR/bin:$PATH
+
+    conda create -n kernel -y
+
+    TINI_VERSION=v0.19.0
+    wget --quiet https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini -O /bin/tini
+    chmod +x /bin/tini
+
+    conda install -n kernel -c conda-forge davix==0.8.6 xrootd==5.5.5 gfal2==2.21.3 gfal2-util==1.9.0 python-gfal2==1.12.0 -y
+
+    PIP="/opt/conda/envs/kernel/bin/python3 -m pip install --no-cache-dir"
+    $PIP rucio==37.7.1 rucio-clients==37.7.1
+    $PIP -U pip setuptools wheel
+    $PIP click ipython ipykernel ipywidgets matplotlib
+
+    # ---- wdflow -----------------------------------------------------------
+    # CPU torch: the default PyPI wheel carries CUDA, which this image never uses.
+    $PIP "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
+    $PIP "torch_geometric>=2.5"
+    # wdflow from the checkout; extras: py4tsa, gwpy, pycbc, jupyter tooling.
+    # ssqueezepy (Morlet CWT) and threadpoolctl are read by the wdf-catalogue notebooks.
+    $PIP "/opt/wdflow-src[pipeline,data,mock,tutorials]" jupyterlab gwosc ssqueezepy threadpoolctl
+    rm -rf /opt/wdflow-src
+
+    conda clean -a -y
+
+%runscript
+    exec /opt/conda/bin/conda run --no-capture-output -n kernel "$@"
+
+%labels
+    org.opencontainers.image.source https://github.com/elenacuoco/wdflow
+
+%test
+    /opt/conda/envs/kernel/bin/python3 -c "import wdf, py4tsa, gwpy, ssqueezepy, gfal2; from wdf.processes.zero_phase_whitening import MagnitudeWhitening; print('wdflow kernel ok')"

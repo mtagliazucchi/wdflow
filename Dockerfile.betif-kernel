@@ -1,0 +1,87 @@
+# A custom Jupyter kernel image for ET-BETIF (https://betif-difaet.readthedocs.io):
+# the platform's kernel baseline (AlmaLinux 9, conda env "kernel", rucio/gfal2
+# data tools, ipykernel), plus wdflow installed from this checkout.
+# https://betif-difaet.readthedocs.io/en/latest/user_guide.html#create-your-own-custom-singularity-kernel-image
+#
+# To build on BETIF itself with Singularity, use wdflow-betif-kernel.def, which
+# is this file translated.
+#
+# Build elsewhere with Docker, from the root of the checkout:
+#   docker build -f Dockerfile.betif-kernel --build-arg WDFLOW_COMMIT=$(git rev-parse --short HEAD) \
+#       -t ghcr.io/<user>/kernel-wdflow:<version>-<commit> .
+# then on BETIF:
+#   singularity pull docker://ghcr.io/<user>/kernel-wdflow:<version>-<commit>
+# and register the .sif through the Kernelspec Manager's Template icon.
+FROM almalinux:9
+
+# ---- platform baseline ----------------------------------------------------
+RUN yum -y clean metadata \
+    && yum install -y dnf-plugins-core \
+    && yum -y install epel-release git wget python39 python3-pip python3-devel boost-python3 jq procps \
+    && yum -y clean all
+
+RUN yum -y install voms-clients-cpp \
+    && yum -y clean all
+
+WORKDIR /
+
+ENV CONDA_DIR=/opt/conda
+
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-py311_25.3.1-1-Linux-x86_64.sh -O ~/miniconda.sh && \
+    /bin/bash ~/miniconda.sh -b -p /opt/conda && rm ~/miniconda.sh
+
+# Put conda in path so we can use conda activate
+ENV PATH=$CONDA_DIR/bin:$PATH
+
+RUN conda init bash
+RUN echo "conda activate kernel" >> ~/.bashrc
+
+RUN conda create -n kernel -y
+SHELL ["conda", "run", "-n", "kernel", "/bin/bash", "-c"]
+
+ENV TINI_VERSION=v0.19.0
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /bin/tini
+RUN chmod +x /bin/tini
+
+RUN conda install -c conda-forge davix==0.8.6 xrootd==5.5.5 gfal2==2.21.3 gfal2-util==1.9.0 python-gfal2==1.12.0 -y
+
+RUN python3 -m pip install rucio==37.7.1 rucio-clients==37.7.1
+
+RUN python3 -m pip install -U pip setuptools wheel
+
+RUN python3 -m pip install \
+    click \
+    ipython \
+    ipykernel \
+    ipywidgets \
+    matplotlib
+
+RUN conda clean -a -y
+
+# ---- wdflow ---------------------------------------------------------------
+# The CPU build of torch: the default one from PyPI carries CUDA, which an
+# image without a GPU never uses.
+RUN python3 -m pip install --no-cache-dir "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu \
+    && python3 -m pip install --no-cache-dir "torch_geometric>=2.5"
+
+# wdflow[pipeline,data,mock,tutorials], from this checkout rather than PyPI:
+#   pipeline  -> py4tsa, the compiled trigger-generation core
+#   data      -> gwpy, for reading/fetching detector strain
+#   mock      -> pycbc, for injections and mock background
+#   tutorials -> jupyter/nbclient/ipykernel, to run tutorials/ notebooks
+# ssqueezepy (Morlet CWT) and threadpoolctl are read by the wdf-catalogue notebooks.
+COPY . /opt/wdflow-src
+RUN python3 -m pip install --no-cache-dir "/opt/wdflow-src[pipeline,data,mock,tutorials]" \
+        jupyterlab gwosc ssqueezepy threadpoolctl \
+    && rm -rf /opt/wdflow-src
+
+# Pulled into Singularity the image is read-only: numba (ssqueezepy's
+# cache=True jits) and matplotlib write their caches here instead.
+ENV NUMBA_CACHE_DIR=/tmp/numba_cache \
+    MPLCONFIGDIR=/tmp/matplotlib
+
+ARG WDFLOW_COMMIT=unknown
+LABEL org.opencontainers.image.source="https://github.com/elenacuoco/wdflow" \
+      org.opencontainers.image.revision="${WDFLOW_COMMIT}"
+
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "kernel"]

@@ -1,0 +1,109 @@
+# syntax=docker/dockerfile:1
+#
+# Builds the ET-BETIF wdflow kernel as a Singularity/Apptainer .sif with Docker
+# alone: no singularity on the build machine, no registry in between. It is
+# wdflow-betif-kernel.def in three stages:
+#   kernel  - the platform's kernel baseline (AlmaLinux 9, conda env "kernel",
+#             rucio/gfal2, ipykernel) plus wdflow from this checkout
+#   sif     - apptainer, from EPEL, packs the kernel rootfs into a SIF and adds
+#             the %environment/%runscript/%labels of the .def
+#   export  - the .sif alone, which `--output` writes to the host
+#
+# From the root of the checkout:
+#   docker build -f Dockerfile.betif-sif --build-arg WDFLOW_COMMIT=$(git rev-parse --short HEAD) \
+#       --output type=local,dest=. .
+# leaves kernel-wdflow.sif here; copy it to BETIF and register it through the
+# Kernelspec Manager's Template icon.
+
+# ---- kernel ---------------------------------------------------------------
+FROM almalinux:9 AS kernel
+
+RUN yum -y clean metadata \
+    && yum install -y dnf-plugins-core \
+    && yum -y install epel-release git wget python39 python3-pip python3-devel boost-python3 jq procps \
+    && yum -y install voms-clients-cpp \
+    && yum -y clean all
+
+ENV CONDA_DIR=/opt/conda
+ENV PATH=/opt/conda/envs/kernel/bin:$CONDA_DIR/bin:$PATH
+
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-py311_25.3.1-1-Linux-x86_64.sh -O /tmp/miniconda.sh \
+    && /bin/bash /tmp/miniconda.sh -b -p $CONDA_DIR \
+    && rm /tmp/miniconda.sh \
+    && conda create -n kernel -y
+
+ENV TINI_VERSION=v0.19.0
+ADD --chmod=755 https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /bin/tini
+
+RUN conda install -n kernel -c conda-forge davix==0.8.6 xrootd==5.5.5 gfal2==2.21.3 gfal2-util==1.9.0 python-gfal2==1.12.0 -y \
+    && conda clean -a -y
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN python3 -m pip install rucio==37.7.1 rucio-clients==37.7.1 \
+    && python3 -m pip install -U pip setuptools wheel \
+    && python3 -m pip install click ipython ipykernel ipywidgets matplotlib
+
+# CPU torch: the default PyPI wheel carries CUDA, which this image never uses.
+RUN python3 -m pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu \
+    && python3 -m pip install "torch_geometric>=2.5"
+
+# wdflow from the checkout; extras: py4tsa, gwpy, pycbc, jupyter tooling.
+# ssqueezepy (Morlet CWT) and threadpoolctl are read by the wdf-catalogue notebooks.
+# Only what the build reads is copied, so editing anything else keeps the
+# layers above cached.
+COPY pyproject.toml README.md /opt/wdflow-src/
+COPY wdf /opt/wdflow-src/wdf
+RUN python3 -m pip install "/opt/wdflow-src[pipeline,data,mock,tutorials]" \
+        jupyterlab gwosc ssqueezepy threadpoolctl \
+    && rm -rf /opt/wdflow-src
+
+# Fail the build rather than ship a kernel whose core does not import:
+# `wdf.analysis` works without py4tsa, so an ordinary import proves nothing.
+RUN python3 -c "import py4tsa.tsa, wdf.analysis, wdf.processes.wdfUnitDSWorker, ipykernel, gfal2, rucio; \
+print('py4tsa, wdf, ipykernel, gfal2 and rucio import')"
+
+# ---- sif ------------------------------------------------------------------
+FROM almalinux:9 AS sif
+
+RUN yum -y install epel-release \
+    && yum -y install apptainer \
+    && yum -y clean all
+
+ARG WDFLOW_COMMIT=unknown
+
+# Docker's ENV and ENTRYPOINT do not survive into a SIF built from a
+# directory, so they are set again here, as the .def sets them.
+COPY <<EOF /build/kernel-wdflow.def
+Bootstrap: localimage
+From: /rootfs
+
+%environment
+    export CONDA_DIR=/opt/conda
+    export PATH=/opt/conda/envs/kernel/bin:/opt/conda/bin:\$PATH
+    export TINI_VERSION=v0.19.0
+    # The image is read-only: numba (ssqueezepy's cache=True jits) and
+    # matplotlib write their caches here instead.
+    export NUMBA_CACHE_DIR=\${TMPDIR:-/tmp}/numba_cache
+    export MPLCONFIGDIR=\${TMPDIR:-/tmp}/matplotlib
+
+%runscript
+    exec /opt/conda/bin/conda run --no-capture-output -n kernel "\$@"
+
+%labels
+    org.opencontainers.image.source https://github.com/elenacuoco/wdflow
+    org.opencontainers.image.revision ${WDFLOW_COMMIT}
+EOF
+
+# The kernel rootfs is bind-mounted rather than copied, which would add a
+# layer as large as the image itself. With no %post, apptainer never runs the
+# container, so it needs no privileges or user namespaces inside the build.
+RUN --mount=type=bind,from=kernel,source=/,target=/rootfs \
+    mkdir -p /out \
+    && apptainer build /out/kernel-wdflow.sif /build/kernel-wdflow.def \
+    && apptainer inspect /out/kernel-wdflow.sif
+
+# ---- export ---------------------------------------------------------------
+FROM scratch AS export
+COPY --from=sif /out/kernel-wdflow.sif /
